@@ -3,53 +3,67 @@ set -euo pipefail
 
 POOL="pool-final"
 NET="net-prod"
-PROXY_IP="10.10.10.10"
-APP_IP="10.10.10.11"
-DB_IP="10.10.10.12"
+if [ "${ENV:-prod}" = "prod" ]; then
+  PROXY_IP="10.10.10.10"
+  APP_IP="10.10.10.11"
+  DB_IP="10.10.10.12"
+  HOST_PORT="8444"
+else
+  PROXY_IP="10.10.10.20"
+  APP_IP="10.10.10.21"
+  DB_IP="10.10.10.22"
+  HOST_PORT="8082"
+fi
 DB_NAME="wordpress"
 DB_USER="wpuser"
 DB_PASS="SenhaForteWP2026!"
-SITE_URL="https://servico.lab:8444"
+SITE_URL="https://servico.lab:${HOST_PORT}"
+ENV="${ENV:-prod}"
+[ "$ENV" = "prod" ] && PREFIXO="" || PREFIXO="dev-"
+DB_INST="${PREFIXO}db"
+APP_INST="${PREFIXO}app"
+PROXY_INST="${PREFIXO}proxy"
+VOL_DB="${PREFIXO}vol-db"
 
 lxc network show "$NET" >/dev/null 2>&1 || lxc network create "$NET" ipv4.address=10.10.10.1/24 ipv4.nat=true ipv6.address=none
 lxc storage show "$POOL" >/dev/null 2>&1 || lxc storage create "$POOL" dir
-lxc storage volume show "$POOL" vol-db >/dev/null 2>&1 || lxc storage volume create "$POOL" vol-db
+lxc storage volume show "$POOL" ${VOL_DB} >/dev/null 2>&1 || lxc storage volume create "$POOL" ${VOL_DB}
 
 for p in perfil-base perfil-db perfil-app perfil-proxy; do
   lxc profile show "$p" >/dev/null 2>&1 || lxc profile create "$p"
   lxc profile edit "$p" < "profiles/${p}.yaml"
 done
 
-lxc info db >/dev/null 2>&1 || lxc init ubuntu:24.04 db --storage "$POOL" --profile perfil-base --profile perfil-db
-lxc config device show db | grep -q "^dados:" || lxc config device add db dados disk pool="$POOL" source=vol-db path=/var/lib/mysql
-lxc config device override db eth0 ipv4.address="$DB_IP" >/dev/null 2>&1 || lxc config device set db eth0 ipv4.address="$DB_IP"
-lxc config set db snapshots.expiry 7d
-lxc storage volume set "$POOL" vol-db snapshots.expiry 7d
+lxc info ${DB_INST} >/dev/null 2>&1 || lxc init ubuntu:24.04 ${DB_INST} --storage "$POOL" --profile perfil-base --profile perfil-db
+lxc config device show ${DB_INST} | grep -q "^dados:" || lxc config device add ${DB_INST} dados disk pool="$POOL" source=${VOL_DB} path=/var/lib/mysql
+lxc config device override ${DB_INST} eth0 ipv4.address="$DB_IP" >/dev/null 2>&1 || lxc config device set ${DB_INST} eth0 ipv4.address="$DB_IP"
+lxc config set ${DB_INST} snapshots.expiry 7d
+lxc storage volume set "$POOL" ${VOL_DB} snapshots.expiry 7d
 
-lxc info app >/dev/null 2>&1 || lxc init ubuntu:24.04 app --storage "$POOL" --profile perfil-base --profile perfil-app
-lxc config device override app eth0 ipv4.address="$APP_IP" >/dev/null 2>&1 || lxc config device set app eth0 ipv4.address="$APP_IP"
+lxc info ${APP_INST} >/dev/null 2>&1 || lxc init ubuntu:24.04 ${APP_INST} --storage "$POOL" --profile perfil-base --profile perfil-app
+lxc config device override ${APP_INST} eth0 ipv4.address="$APP_IP" >/dev/null 2>&1 || lxc config device set ${APP_INST} eth0 ipv4.address="$APP_IP"
 
-lxc info proxy >/dev/null 2>&1 || lxc init ubuntu:24.04 proxy --storage "$POOL" --profile perfil-base --profile perfil-proxy
-lxc config device override proxy eth0 ipv4.address="$PROXY_IP" >/dev/null 2>&1 || lxc config device set proxy eth0 ipv4.address="$PROXY_IP"
-lxc config device show proxy | grep -q ":8444" || lxc config device add proxy https-port proxy listen=tcp:0.0.0.0:8444 connect=tcp:127.0.0.1:443
+lxc info ${PROXY_INST} >/dev/null 2>&1 || lxc init ubuntu:24.04 ${PROXY_INST} --storage "$POOL" --profile perfil-base --profile perfil-proxy
+lxc config device override ${PROXY_INST} eth0 ipv4.address="$PROXY_IP" >/dev/null 2>&1 || lxc config device set ${PROXY_INST} eth0 ipv4.address="$PROXY_IP"
+lxc config device show ${PROXY_INST} | grep -q ":${HOST_PORT}" || lxc config device add ${PROXY_INST} https-port proxy listen=tcp:0.0.0.0:${HOST_PORT} connect=tcp:127.0.0.1:443
 
-lxc start db app proxy 2>/dev/null || true
-for c in db app proxy; do
+lxc start ${DB_INST} ${APP_INST} ${PROXY_INST} 2>/dev/null || true
+for c in ${DB_INST} ${APP_INST} ${PROXY_INST}; do
   lxc exec "$c" -- cloud-init status --wait >/dev/null 2>&1 || true
 done
 
-lxc file push conf/config-mariadb.sh db/root/config-mariadb.sh
-lxc exec db -- bash /root/config-mariadb.sh "$APP_IP" "$DB_NAME" "$DB_USER" "$DB_PASS"
+lxc file push conf/config-mariadb.sh ${DB_INST}/root/config-mariadb.sh
+lxc exec ${DB_INST} -- bash /root/config-mariadb.sh "$APP_IP" "$DB_NAME" "$DB_USER" "$DB_PASS"
 
-lxc file push conf/instala-wp.sh app/root/instala-wp.sh
-lxc exec app -- bash /root/instala-wp.sh "$DB_IP" "$DB_PASS" "$SITE_URL"
+lxc file push conf/instala-wp.sh ${APP_INST}/root/instala-wp.sh
+lxc exec ${APP_INST} -- bash /root/instala-wp.sh "$DB_IP" "$DB_PASS" "$SITE_URL"
 
-lxc file push conf/tls/servico.crt proxy/etc/ssl/certs/servico.crt
-lxc file push conf/tls/servico.key proxy/etc/ssl/private/servico.key
-lxc exec proxy -- chmod 600 /etc/ssl/private/servico.key
-lxc file push conf/nginx-servico.conf proxy/etc/nginx/sites-available/servico.conf
-lxc exec proxy -- ln -sf /etc/nginx/sites-available/servico.conf /etc/nginx/sites-enabled/servico.conf
-lxc exec proxy -- rm -f /etc/nginx/sites-enabled/default
-lxc exec proxy -- nginx -t
-lxc exec proxy -- systemctl reload nginx
+lxc file push conf/tls/servico.crt ${PROXY_INST}/etc/ssl/certs/servico.crt
+lxc file push conf/tls/servico.key ${PROXY_INST}/etc/ssl/private/servico.key
+lxc exec ${PROXY_INST} -- chmod 600 /etc/ssl/private/servico.key
+lxc file push conf/nginx-servico.conf ${PROXY_INST}/etc/nginx/sites-available/servico.conf
+lxc exec ${PROXY_INST} -- ln -sf /etc/nginx/sites-available/servico.conf /etc/nginx/sites-enabled/servico.conf
+lxc exec ${PROXY_INST} -- rm -f /etc/nginx/sites-enabled/default
+lxc exec ${PROXY_INST} -- nginx -t
+lxc exec ${PROXY_INST} -- systemctl reload nginx
 echo "Deploy concluido com sucesso! Acesse: $SITE_URL"
